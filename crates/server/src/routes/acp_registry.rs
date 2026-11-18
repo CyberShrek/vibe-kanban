@@ -185,6 +185,12 @@ async fn uninstall_agent(
     profiles.save_overrides()?;
     ExecutorConfigs::reload();
 
+    // The cache dir keeps every downloaded archive of the agent; leaving it
+    // behind strands 100 MB+ per agent on disk.
+    if let Err(e) = install::remove_agent_files(&id) {
+        tracing::warn!("Failed to delete cached archives of ACP agent '{id}': {e}");
+    }
+
     Ok(ResponseJson(ApiResponse::success(())))
 }
 

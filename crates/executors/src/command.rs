@@ -22,7 +22,7 @@ pub enum CommandBuildError {
 
 #[derive(Debug, Clone)]
 pub struct CommandParts {
-    program: String,
+    pub program: String,
     args: Vec<String>,
 }
 

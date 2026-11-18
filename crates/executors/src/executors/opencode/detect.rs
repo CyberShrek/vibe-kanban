@@ -10,6 +10,8 @@ use std::time::Duration;
 use serde::Serialize;
 use ts_rs::TS;
 
+use crate::executors::acp::{install, registry};
+
 /// How long `opencode --version` may take. It only prints and exits, but a
 /// cold start on Windows can take a moment.
 const VERSION_TIMEOUT: Duration = Duration::from_secs(5);
@@ -23,12 +25,26 @@ pub struct OpencodeVersion {
     pub major: Option<u32>,
 }
 
+/// Registry id of the OpenCode V2 binary distribution.
+const V2_REGISTRY_ID: &str = "opencode-v2";
+
 /// Runs `opencode --version` and parses the result. Never fails: a missing or
 /// broken CLI is reported as "not detected".
 pub async fn detect_installed() -> OpencodeVersion {
+    // A registry install of V2 is the strongest signal: the user picked it in
+    // Available agents, and its binary lives in the cache dir, not on `PATH`.
+    // Without this the picker would detect V1 (or nothing) and hide V2 right
+    // after the user installed it.
+    if let Some(version) = registry_installed().await {
+        return version;
+    }
     let Some(version) = read_version().await else {
         return OpencodeVersion::default();
     };
+    from_version(version)
+}
+
+fn from_version(version: String) -> OpencodeVersion {
     let major = version
         .split('.')
         .next()
@@ -38,6 +54,32 @@ pub async fn detect_installed() -> OpencodeVersion {
         version: Some(version),
         major,
     }
+}
+
+/// Version of the `opencode-v2` binary installed from the ACP registry, if any.
+/// Reads the cached registry document and the unpacked archive only: detection
+/// must not download anything.
+async fn registry_installed() -> Option<OpencodeVersion> {
+    let agents = registry::cached().await.ok()?;
+    let agent = agents.iter().find(|agent| agent.id == V2_REGISTRY_ID)?;
+    let platform = install::platform_key()?;
+    let target = agent.distribution.binary.get(platform)?;
+    let installed = install::installed(V2_REGISTRY_ID, &agent.version, platform, target).ok()?;
+
+    let output = tokio::time::timeout(
+        VERSION_TIMEOUT,
+        tokio::process::Command::new(&installed.command)
+            .arg("--version")
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .ok()?
+    .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    from_version(parse_version(&String::from_utf8_lossy(&output.stdout))?).into()
 }
 
 async fn read_version() -> Option<String> {

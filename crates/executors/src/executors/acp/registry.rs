@@ -130,11 +130,14 @@ pub fn visible_agents(agents: &[RegistryAgent]) -> Vec<RegistryAgent> {
 
 /// npx works everywhere; an archive only where the registry ships one for the
 /// host platform, so agents that only ship e.g. `darwin-aarch64` are not offered
-/// on Windows or Linux.
+/// on Windows or Linux. Archives without a checksum are not offered either:
+/// `verify_checksum` refuses to install them, so listing them would only offer
+/// a dead end.
 fn available_on(agent: &RegistryAgent, platform: Option<&str>) -> bool {
     agent.distribution.npx.is_some()
         || platform
             .and_then(|platform| agent.distribution.binary.get(platform))
+            .filter(|target| target.sha256.is_some())
             .is_some()
 }
 
@@ -180,10 +183,12 @@ impl RegistryAgent {
 
 /// The command for a registry agent and the env its distribution sets.
 ///
-/// Prefers the npx package, then the platform archive (downloaded into the cache
-/// dir on first use). A `base_command_override` replaces the base of either and
-/// skips the download, which lets users point an agent at a binary they installed
-/// themselves.
+/// Prefers the npx package, then the platform archive — already unpacked in
+/// the cache dir. Installs and updates happen only from the settings install
+/// route; this path never downloads, so a missing or outdated install returns
+/// an error pointing there. A `base_command_override` replaces the base of
+/// either and skips the archive entirely, which lets users point an agent at a
+/// binary they installed themselves.
 pub async fn command_for(
     agent: &RegistryAgent,
     overrides: &CmdOverrides,
@@ -221,7 +226,7 @@ pub async fn command_for(
         }
     })?;
 
-    let installed = install::ensure_installed(&agent.id, &agent.version, host, target).await?;
+    let installed = install::installed(&agent.id, &agent.version, host, target)?;
     let command = CommandBuilder::new(install::command_line(&installed.command))
         .extend_params(installed.args.clone());
 
@@ -404,6 +409,19 @@ mod tests {
         assert!(!available_on(goose, None));
         // npx agents need no archive, so they show on every platform
         assert!(available_on(auggie, None));
+    }
+
+    #[test]
+    fn binary_agents_without_a_checksum_are_not_offered() {
+        let agents = parse_registry(FIXTURE).unwrap();
+        let mut goose = agents.iter().find(|a| a.id == "goose").unwrap().clone();
+        goose
+            .distribution
+            .binary
+            .get_mut("darwin-aarch64")
+            .unwrap()
+            .sha256 = None;
+        assert!(!available_on(&goose, Some("darwin-aarch64")));
     }
 
     #[tokio::test]

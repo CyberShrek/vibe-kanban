@@ -9,6 +9,11 @@
 //! through [`zip::read::ZipFile::enclosed_name`] and tar archives through
 //! [`tar::Archive::unpack`], which both reject absolute and parent-relative
 //! paths.
+//!
+//! The registry is remote input, so archives are only fetched over HTTPS and
+//! only when the registry entry carries a SHA-256. Spawning never downloads:
+//! [`installed`] serves an existing install and otherwise fails, downloads
+//! happen only from the settings install route.
 
 use std::{
     collections::HashMap,
@@ -28,6 +33,8 @@ use crate::executors::acp::registry::BinaryTarget;
 /// Large binaries (Cursor, Junie) take a while on slow connections.
 const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const MAX_ARCHIVE_BYTES: u64 = 1024 * 1024 * 1024;
+/// Zip bombs: the download is capped, the unpacked tree must be too.
+const MAX_UNPACKED_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 /// Written last, so a half-unpacked directory is never mistaken for a finished one.
 const MARKER_FILE: &str = ".installed";
 const INSTALL_DIR: &str = "acp-agents";
@@ -35,6 +42,9 @@ const INSTALL_DIR: &str = "acp-agents";
 static HTTP_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
     reqwest::Client::builder()
         .timeout(DOWNLOAD_TIMEOUT)
+        // Registry URLs are HTTPS today; this also refuses an HTTPS -> HTTP
+        // redirect, which no check on the URL string itself would catch.
+        .https_only(true)
         .user_agent(concat!("vibe-kanban/", env!("CARGO_PKG_VERSION")))
         .build()
         .expect("failed to build ACP archive download client")
@@ -96,6 +106,16 @@ pub enum InstallError {
     },
     #[error("agent archive {url} is larger than {MAX_ARCHIVE_BYTES} bytes")]
     TooLarge { url: String },
+    #[error("refusing to download agent archive over insecure URL {url}")]
+    InsecureUrl { url: String },
+    #[error("agent archive {url} has no sha256 in the registry; refusing to install it unverified")]
+    MissingChecksum { url: String },
+    #[error("unpacked agent archive exceeds {MAX_UNPACKED_BYTES} bytes")]
+    UnpackTooLarge,
+    #[error(
+        "{id} is not installed, or needs an update after a registry change; install or update it in Settings → Available agents"
+    )]
+    NotInstalled { id: String },
     #[error("checksum mismatch for {url}: expected {expected}, got {actual}")]
     Checksum {
         url: String,
@@ -142,6 +162,9 @@ fn platform_key_for(os: &str, arch: &str, musl: bool) -> Option<&'static str> {
 
 /// Downloads and unpacks the agent if needed, then returns its command.
 ///
+/// Only the settings install route calls this: spawning must not download,
+/// so the spawn and discovery paths use [`installed`] instead.
+///
 /// Idempotent: a finished install (marker file + command present) is reused and
 /// nothing is fetched.
 pub async fn ensure_installed(
@@ -166,20 +189,57 @@ pub async fn ensure_installed(
     result
 }
 
-async fn install_locked(
+/// The command of an already-installed agent, without any network access.
+///
+/// Used by the spawn and discovery paths: a spawn must never download (up to
+/// 1 GiB with a 10-minute timeout), so a missing or outdated install fails
+/// with a pointer to Settings instead.
+pub fn installed(
+    agent_id: &str,
+    version: &str,
+    platform: &str,
+    target: &BinaryTarget,
+) -> Result<InstalledAgent, InstallError> {
+    if let Ok(agent) = install_from_disk(agent_id, version, platform, target) {
+        return Ok(agent);
+    }
+    Err(InstallError::NotInstalled {
+        id: agent_id.to_string(),
+    })
+}
+
+/// The finished install under `install_dir`, if the marker and the command are
+/// both there. Broken installs are reported as absent so the caller can repair
+/// them (downloads) or refuse (spawns).
+fn install_from_disk(
     agent_id: &str,
     version: &str,
     platform: &str,
     target: &BinaryTarget,
 ) -> Result<InstalledAgent, InstallError> {
     let dir = install_dir(agent_id, version, platform);
-    if dir.join(MARKER_FILE).is_file() && command_path(&dir, &target.cmd)?.is_file() {
-        return installed(target, &dir);
+    if dir.join(MARKER_FILE).is_file() && contained_command(&dir, &target.cmd).is_ok() {
+        return installed_agent(target, &dir);
+    }
+    Err(InstallError::NotInstalled {
+        id: agent_id.to_string(),
+    })
+}
+
+async fn install_locked(
+    agent_id: &str,
+    version: &str,
+    platform: &str,
+    target: &BinaryTarget,
+) -> Result<InstalledAgent, InstallError> {
+    if let Ok(agent) = install_from_disk(agent_id, version, platform, target) {
+        return Ok(agent);
     }
 
     let bytes = download(&target.archive, agent_id).await?;
     verify_checksum(&target.archive, &bytes, target.sha256.as_deref())?;
 
+    let dir = install_dir(agent_id, version, platform);
     let parent = dir
         .parent()
         .ok_or_else(|| InstallError::Unpack(format!("no parent for {}", dir.display())))?;
@@ -206,18 +266,56 @@ async fn install_locked(
         return Err(e);
     }
 
-    set_executable(&command_path(&temp, &target.cmd)?)?;
+    set_executable(&contained_command(&temp, &target.cmd)?)?;
     tokio::fs::write(temp.join(MARKER_FILE), b"ok").await?;
 
-    if let Err(e) = tokio::fs::rename(&temp, &dir).await {
-        // Another process finished first: keep its copy.
-        let _ = tokio::fs::remove_dir_all(&temp).await;
-        if !(dir.join(MARKER_FILE).is_file() && command_path(&dir, &target.cmd)?.is_file()) {
-            return Err(e.into());
+    match tokio::fs::rename(&temp, &dir).await {
+        Ok(()) => prune_other_versions(&dir, platform).await,
+        Err(_) => {
+            // Another finished install may own the directory; a broken leftover
+            // (no marker or no command) is cleared so this install replaces it.
+            let usable =
+                dir.join(MARKER_FILE).is_file() && contained_command(&dir, &target.cmd).is_ok();
+            if !usable {
+                let _ = tokio::fs::remove_dir_all(&dir).await;
+                if let Err(e) = tokio::fs::rename(&temp, &dir).await {
+                    let _ = tokio::fs::remove_dir_all(&temp).await;
+                    return Err(e.into());
+                }
+                prune_other_versions(&dir, platform).await;
+            } else {
+                let _ = tokio::fs::remove_dir_all(&temp).await;
+            }
         }
     }
 
-    installed(target, &dir)
+    installed_agent(target, &dir)
+}
+
+/// Drops the other cached versions of this agent for the same platform: every
+/// registry bump installs a new `{version}-{platform}` directory, and archives
+/// are 100 MB+ each.
+async fn prune_other_versions(current: &Path, platform: &str) {
+    let Some(parent) = current.parent() else {
+        return;
+    };
+    let suffix = format!("-{platform}");
+    let Ok(mut entries) = tokio::fs::read_dir(parent).await else {
+        return;
+    };
+    let mut stale = Vec::new();
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let Some(name) = entry.file_name().into_string().ok() else {
+            continue;
+        };
+        // Skip in-flight downloads (`.install-*` temp dirs) and other platforms.
+        if !name.starts_with('.') && name.ends_with(&suffix) && entry.path() != current {
+            stale.push(entry.path());
+        }
+    }
+    for path in stale {
+        let _ = tokio::fs::remove_dir_all(&path).await;
+    }
 }
 
 /// Quotes a path for [`crate::command::CommandBuilder`], which splits its base
@@ -225,16 +323,28 @@ async fn install_locked(
 /// path may contain spaces.
 pub fn command_line(path: &Path) -> String {
     let path = path.to_string_lossy();
-    if path.chars().any(char::is_whitespace) {
-        format!("\"{path}\"")
-    } else {
-        path.into_owned()
+    #[cfg(unix)]
+    {
+        // `shlex` re-splits the base, so quote with the same parser: a plain
+        // surrounding `"` breaks on a cache path containing `'` or `\`.
+        match shlex::try_quote(&path) {
+            Ok(quoted) => quoted.into_owned(),
+            Err(_) => path.into_owned(),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        if path.chars().any(char::is_whitespace) {
+            format!("\"{path}\"")
+        } else {
+            path.into_owned()
+        }
     }
 }
 
-fn installed(target: &BinaryTarget, dir: &Path) -> Result<InstalledAgent, InstallError> {
+fn installed_agent(target: &BinaryTarget, dir: &Path) -> Result<InstalledAgent, InstallError> {
     Ok(InstalledAgent {
-        command: command_path(dir, &target.cmd)?,
+        command: contained_command(dir, &target.cmd)?,
         args: target.args.clone(),
         env: target.env.clone(),
     })
@@ -274,6 +384,22 @@ fn command_path(dir: &Path, cmd: &str) -> Result<PathBuf, InstallError> {
         .unwrap_or(cmd);
     let relative = Path::new(relative);
 
+    // The path is later re-split by a shell-like parser (`shlex` on Unix,
+    // `winsplit` on Windows), so quotes would smuggle components past the
+    // check below: `x/".."/".."/bin/sh` passes `Component::Normal` and then
+    // unquotes to `x/../../bin/sh`.
+    if cmd.contains('"') || cmd.contains('\'') || cmd.chars().any(char::is_whitespace) {
+        return Err(InstallError::UnsafeEntry {
+            path: cmd.to_string(),
+        });
+    }
+    #[cfg(not(windows))]
+    if cmd.contains('\\') {
+        return Err(InstallError::UnsafeEntry {
+            path: cmd.to_string(),
+        });
+    }
+
     let escapes = relative.is_absolute()
         || relative
             .components()
@@ -287,7 +413,38 @@ fn command_path(dir: &Path, cmd: &str) -> Result<PathBuf, InstallError> {
     Ok(dir.join(relative))
 }
 
+/// The command path resolved through symlinks and required to stay inside the
+/// install directory. Archives can ship a symlink pointing anywhere, and both
+/// the chmod and the actual run follow links, so a link to e.g.
+/// `~/.ssh/id_rsa` must never be made executable.
+fn contained_command(dir: &Path, cmd: &str) -> Result<PathBuf, InstallError> {
+    let path = command_path(dir, cmd)?;
+    let resolved = path
+        .canonicalize()
+        .map_err(|_| InstallError::MissingCommand {
+            cmd: cmd.to_string(),
+        })?;
+    let root = dir
+        .canonicalize()
+        .map_err(|_| InstallError::MissingCommand {
+            cmd: cmd.to_string(),
+        })?;
+    if !resolved.starts_with(&root) {
+        return Err(InstallError::UnsafeEntry {
+            path: cmd.to_string(),
+        });
+    }
+    Ok(resolved)
+}
+
 async fn download(url: &str, agent_id: &str) -> Result<Vec<u8>, InstallError> {
+    // `https_only` on the client also refuses HTTPS -> HTTP redirects; this
+    // check catches the plain-HTTP URL itself with an error that names it.
+    if !url.starts_with("https://") {
+        return Err(InstallError::InsecureUrl {
+            url: url.to_string(),
+        });
+    }
     let response = HTTP_CLIENT
         .get(url)
         .send()
@@ -341,11 +498,11 @@ async fn download(url: &str, agent_id: &str) -> Result<Vec<u8>, InstallError> {
 
 fn verify_checksum(url: &str, bytes: &[u8], expected: Option<&str>) -> Result<(), InstallError> {
     let Some(expected) = expected else {
-        tracing::warn!(
-            url,
-            "ACP agent archive has no sha256, skipping verification"
-        );
-        return Ok(());
+        // The registry is remote input: without a checksum the archive is
+        // whatever the host serves at that moment, so refuse to install it.
+        return Err(InstallError::MissingChecksum {
+            url: url.to_string(),
+        });
     };
 
     let actual = format!("{:x}", Sha256::digest(bytes));
@@ -387,11 +544,29 @@ fn archive_kind(url: &str) -> ArchiveKind {
 }
 
 fn unpack(bytes: &[u8], target: &BinaryTarget, dest: &Path) -> Result<(), InstallError> {
+    unpack_capped(bytes, target, dest, MAX_UNPACKED_BYTES)
+}
+
+/// `cap` bounds the bytes written to disk: only the download is size-limited,
+/// so without this a zip bomb would fill the disk. Test seam for the cap.
+fn unpack_capped(
+    bytes: &[u8],
+    target: &BinaryTarget,
+    dest: &Path,
+    cap: u64,
+) -> Result<(), InstallError> {
     match archive_kind(&target.archive) {
-        ArchiveKind::Zip => unpack_zip(bytes, dest),
-        ArchiveKind::TarGz => unpack_tar(flate2::read::GzDecoder::new(Cursor::new(bytes)), dest),
-        ArchiveKind::TarBz2 => unpack_tar(bzip2::read::BzDecoder::new(Cursor::new(bytes)), dest),
+        ArchiveKind::Zip => unpack_zip(bytes, dest, cap),
+        ArchiveKind::TarGz => {
+            unpack_tar(flate2::read::GzDecoder::new(Cursor::new(bytes)), dest, cap)
+        }
+        ArchiveKind::TarBz2 => {
+            unpack_tar(bzip2::read::BzDecoder::new(Cursor::new(bytes)), dest, cap)
+        }
         ArchiveKind::Raw => {
+            if bytes.len() as u64 > cap {
+                return Err(InstallError::UnpackTooLarge);
+            }
             let path = command_path(dest, &target.cmd)?;
             if let Some(parent) = path.parent() {
                 std::fs::create_dir_all(parent)?;
@@ -402,12 +577,13 @@ fn unpack(bytes: &[u8], target: &BinaryTarget, dest: &Path) -> Result<(), Instal
     }
 }
 
-fn unpack_zip(bytes: &[u8], dest: &Path) -> Result<(), InstallError> {
+fn unpack_zip(bytes: &[u8], dest: &Path, cap: u64) -> Result<(), InstallError> {
     use std::io::Write;
 
     let mut archive = zip::ZipArchive::new(Cursor::new(bytes))
         .map_err(|e| InstallError::Unpack(e.to_string()))?;
 
+    let mut written: u64 = 0;
     for index in 0..archive.len() {
         let mut entry = archive
             .by_index(index)
@@ -420,8 +596,36 @@ fn unpack_zip(bytes: &[u8], dest: &Path) -> Result<(), InstallError> {
         };
         let out = dest.join(relative);
 
+        written += entry.size();
+        if written > cap {
+            return Err(InstallError::UnpackTooLarge);
+        }
+
         if entry.is_dir() {
             std::fs::create_dir_all(&out)?;
+            apply_unix_mode(&out, entry.unix_mode())?;
+            continue;
+        }
+
+        // Zip stores neither Unix modes nor symlinks unless they are written
+        // explicitly; the macOS `.app` zips (junie) need both, so restore them
+        // instead of leaving everything 0o644 regular files.
+        if entry.is_symlink() {
+            let mut link_target = String::new();
+            entry
+                .read_to_string(&mut link_target)
+                .map_err(|e| InstallError::Unpack(e.to_string()))?;
+            #[cfg(unix)]
+            {
+                if let Some(parent) = out.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                std::os::unix::fs::symlink(link_target.trim_end_matches('\0'), &out)?;
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = link_target; // no trustworthy symlink flag on Windows; skip
+            }
             continue;
         }
 
@@ -431,17 +635,59 @@ fn unpack_zip(bytes: &[u8], dest: &Path) -> Result<(), InstallError> {
         let mut file = std::fs::File::create(&out)?;
         std::io::copy(&mut entry, &mut file)?;
         file.flush()?;
+        apply_unix_mode(&out, entry.unix_mode())?;
     }
 
     Ok(())
 }
 
-fn unpack_tar<R: Read>(reader: R, dest: &Path) -> Result<(), InstallError> {
+#[cfg(unix)]
+fn apply_unix_mode(path: &Path, mode: Option<u32>) -> Result<(), InstallError> {
+    use std::os::unix::fs::PermissionsExt;
+
+    if let Some(mode) = mode {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode & 0o7777))?;
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn apply_unix_mode(_path: &Path, _mode: Option<u32>) -> Result<(), InstallError> {
+    Ok(())
+}
+
+fn unpack_tar<R: Read>(reader: R, dest: &Path, cap: u64) -> Result<(), InstallError> {
     std::fs::create_dir_all(dest)?;
-    // `unpack` skips (and refuses) entries that would escape `dest`.
-    tar::Archive::new(reader)
-        .unpack(dest)
-        .map_err(|e| InstallError::Unpack(e.to_string()))
+    let mut written: u64 = 0;
+    let mut archive = tar::Archive::new(reader);
+    let mut entries = archive
+        .entries()
+        .map_err(|e| InstallError::Unpack(e.to_string()))?;
+    // Per-entry `unpack_in` keeps tar's own protections: modes, symlinks and
+    // refusal to escape `dest`, same as `Archive::unpack`. A `false` return
+    // means the entry was skipped as unsafe, which `Archive::unpack` would
+    // have turned into an error too.
+    while let Some(mut entry) = entries
+        .next()
+        .transpose()
+        .map_err(|e| InstallError::Unpack(e.to_string()))?
+    {
+        written += entry.header().size()?;
+        if written > cap {
+            return Err(InstallError::UnpackTooLarge);
+        }
+        let unpacked = entry
+            .unpack_in(dest)
+            .map_err(|e| InstallError::Unpack(e.to_string()))?;
+        if !unpacked {
+            let path = entry
+                .path()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|_| "<unreadable>".to_string());
+            return Err(InstallError::UnsafeEntry { path });
+        }
+    }
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -466,6 +712,20 @@ fn set_executable(path: &Path) -> Result<(), InstallError> {
         });
     }
     Ok(())
+}
+
+/// Deletes every cached archive of `agent_id`, all versions and platforms.
+/// Best-effort by design: uninstall must succeed even when the files are
+/// already gone.
+pub fn remove_agent_files(agent_id: &str) -> std::io::Result<()> {
+    let dir = workspace_utils::cache_dir()
+        .join(INSTALL_DIR)
+        .join(safe_component(agent_id));
+    match std::fs::remove_dir_all(&dir) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
 }
 
 #[cfg(test)]
@@ -538,7 +798,16 @@ mod tests {
     #[test]
     fn command_path_rejects_escapes() {
         let dir = Path::new("/tmp/agent");
-        for cmd in ["../evil", "/usr/bin/evil", "a/../../evil"] {
+        for cmd in [
+            "../evil",
+            "/usr/bin/evil",
+            "a/../../evil",
+            // Quotes pass the `Component::Normal` check but unquote to `..`
+            // when the base command is re-split by `shlex`/`winsplit`.
+            "x/\"..\"/\"..\"/bin/sh",
+            "a b",
+            "a'b",
+        ] {
             assert!(
                 matches!(
                     command_path(dir, cmd),
@@ -552,6 +821,34 @@ mod tests {
             command_path(dir, "C:\\evil.exe"),
             Err(InstallError::UnsafeEntry { .. })
         ));
+    }
+
+    #[test]
+    #[cfg(not(windows))]
+    fn command_path_rejects_backslashes_on_unix() {
+        assert!(matches!(
+            command_path(Path::new("/tmp/agent"), "bin\\agent"),
+            Err(InstallError::UnsafeEntry { .. })
+        ));
+    }
+
+    #[test]
+    fn contained_command_rejects_symlinks_out_of_the_install_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("bin")).unwrap();
+        std::fs::write(dir.path().join("bin/agent"), b"agent").unwrap();
+        // In-tree link resolves inside the dir: allowed.
+        assert!(contained_command(dir.path(), "bin/agent").is_ok());
+
+        #[cfg(unix)]
+        {
+            let outside = tempfile::tempdir().unwrap();
+            std::os::unix::fs::symlink(outside.path(), dir.path().join("bin/link")).unwrap();
+            assert!(matches!(
+                contained_command(dir.path(), "bin/link"),
+                Err(InstallError::UnsafeEntry { .. })
+            ));
+        }
     }
 
     #[test]
@@ -571,7 +868,29 @@ mod tests {
             verify_checksum("https://x/a.zip", bytes, Some(&"0".repeat(64))),
             Err(InstallError::Checksum { .. })
         ));
-        assert!(verify_checksum("https://x/a.zip", bytes, None).is_ok());
+    }
+
+    #[test]
+    fn missing_checksum_is_rejected() {
+        assert!(matches!(
+            verify_checksum("https://x/a.zip", b"hello", None),
+            Err(InstallError::MissingChecksum { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn plain_http_downloads_are_refused() {
+        // Fails on the scheme guard before any network access happens; a
+        // redirect to http:// is refused by `https_only` on the client.
+        for url in ["http://x/a.zip", "ftp://x/a.zip", "https:x/a.zip"] {
+            assert!(
+                matches!(
+                    download(url, "test").await,
+                    Err(InstallError::InsecureUrl { .. })
+                ),
+                "{url} must be refused"
+            );
+        }
     }
 
     #[test]
@@ -638,11 +957,71 @@ mod tests {
     }
 
     #[test]
-    fn command_line_quotes_paths_with_spaces() {
-        assert_eq!(command_line(Path::new("/opt/agent")), "/opt/agent");
-        assert_eq!(
-            command_line(Path::new("C:\\Users\\Jane Doe\\agent.exe")),
-            "\"C:\\Users\\Jane Doe\\agent.exe\""
-        );
+    fn command_line_round_trips_through_the_command_splitter() {
+        // The base command is re-split by `shlex`/`winsplit`, so whatever we
+        // quote must come back out as a single word (spaces, quotes, and on
+        // Unix backslashes are the interesting cache-dir characters).
+        for path in ["/opt/agent", "/opt/my agent", "/o'pt/agent", "/opt/a\\b"] {
+            let quoted = command_line(Path::new(path));
+            let built = crate::command::CommandBuilder::new(quoted)
+                .build_initial()
+                .unwrap_or_else(|e| panic!("{path}: {e}"));
+            assert_eq!(built.program, path);
+        }
+    }
+
+    #[test]
+    fn zip_unpack_keeps_symlinks_and_modes() {
+        let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated)
+            .unix_permissions(0o755);
+        writer.start_file("bin/agent", options).unwrap();
+        writer.write_all(b"agent").unwrap();
+        writer.add_symlink("bin/latest", "agent", options).unwrap();
+        let bytes = writer.finish().unwrap().into_inner();
+
+        let dest = tempfile::tempdir().unwrap();
+        unpack(&bytes, &target("https://x/a.zip"), dest.path()).unwrap();
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(dest.path().join("bin/agent"))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o111, 0o111, "executable bit must survive");
+            assert!(
+                std::fs::symlink_metadata(dest.path().join("bin/latest"))
+                    .unwrap()
+                    .file_type()
+                    .is_symlink()
+            );
+        }
+    }
+
+    #[test]
+    fn unpack_is_capped() {
+        // Raw path over the cap.
+        let dest = tempfile::tempdir().unwrap();
+        assert!(matches!(
+            unpack_capped(b"raw", &target("https://x/agent.exe"), dest.path(), 2),
+            Err(InstallError::UnpackTooLarge)
+        ));
+
+        // Zip path over the cap: two 3-byte files against a 4-byte cap.
+        let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        let options = zip::write::SimpleFileOptions::default();
+        for name in ["a", "b"] {
+            writer.start_file(name, options).unwrap();
+            writer.write_all(b"abc").unwrap();
+        }
+        let bytes = writer.finish().unwrap().into_inner();
+        let dest = tempfile::tempdir().unwrap();
+        assert!(matches!(
+            unpack_capped(&bytes, &target("https://x/a.zip"), dest.path(), 4),
+            Err(InstallError::UnpackTooLarge)
+        ));
     }
 }
