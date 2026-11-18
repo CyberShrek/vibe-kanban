@@ -192,20 +192,48 @@ pub async fn ensure_installed(
 /// The command of an already-installed agent, without any network access.
 ///
 /// Used by the spawn and discovery paths: a spawn must never download (up to
-/// 1 GiB with a 10-minute timeout), so a missing or outdated install fails
-/// with a pointer to Settings instead.
+/// 1 GiB with a 10-minute timeout), so a missing install fails with a pointer
+/// to Settings instead.
+///
+/// The version on disk wins over the registry's current one: a registry bump
+/// must not break an installed agent. Any finished `{version}-{platform}`
+/// install counts, newest first, so Settings can install a newer version and
+/// the old one keeps running until then.
 pub fn installed(
     agent_id: &str,
-    version: &str,
     platform: &str,
     target: &BinaryTarget,
 ) -> Result<InstalledAgent, InstallError> {
-    if let Ok(agent) = install_from_disk(agent_id, version, platform, target) {
-        return Ok(agent);
-    }
-    Err(InstallError::NotInstalled {
-        id: agent_id.to_string(),
-    })
+    let agent_root = workspace_utils::cache_dir()
+        .join(INSTALL_DIR)
+        .join(safe_component(agent_id));
+    let suffix = format!("-{platform}");
+
+    let mut candidates: Vec<(std::time::SystemTime, PathBuf)> = std::fs::read_dir(&agent_root)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.file_name().into_string().ok()?;
+            if name.starts_with('.') || !name.ends_with(&suffix) {
+                return None;
+            }
+            let dir = entry.path();
+            if !dir.join(MARKER_FILE).is_file() {
+                return None;
+            }
+            let modified = entry.metadata().ok()?.modified().ok()?;
+            Some((modified, dir))
+        })
+        .collect();
+    candidates.sort_by(|a, b| b.0.cmp(&a.0));
+
+    candidates
+        .into_iter()
+        .find_map(|(_, dir)| installed_agent(target, &dir).ok())
+        .ok_or_else(|| InstallError::NotInstalled {
+            id: agent_id.to_string(),
+        })
 }
 
 /// The finished install under `install_dir`, if the marker and the command are
@@ -434,7 +462,10 @@ fn contained_command(dir: &Path, cmd: &str) -> Result<PathBuf, InstallError> {
             path: cmd.to_string(),
         });
     }
-    Ok(resolved)
+    // Run the original, non-canonicalized path: on Windows `canonicalize`
+    // returns `\\?\C:\…` verbatim paths, which break `.cmd` launchers
+    // (Cursor). The resolved path is only used for the containment check.
+    Ok(path)
 }
 
 async fn download(url: &str, agent_id: &str) -> Result<Vec<u8>, InstallError> {
@@ -577,6 +608,61 @@ fn unpack_capped(
     }
 }
 
+/// The entry's path under `dest`, after checking that no component of it is
+/// a symlink we (or a previous entry) created. `enclosed_name` alone is not
+/// enough: an earlier entry can plant `lib -> ~/.ssh` and a later
+/// `lib/authorized_keys` would then be written *through* the link, outside
+/// `dest`, at install time. Refusing to traverse links at all also keeps the
+/// permission restore from touching anything outside `dest`.
+fn safe_entry_path(dest: &Path, relative: &Path) -> Result<PathBuf, InstallError> {
+    let mut prefix = dest.to_path_buf();
+    for component in relative.components() {
+        prefix.push(component);
+        if let Ok(meta) = std::fs::symlink_metadata(&prefix)
+            && meta.file_type().is_symlink()
+        {
+            return Err(InstallError::UnsafeEntry {
+                path: relative.display().to_string(),
+            });
+        }
+    }
+    Ok(dest.join(relative))
+}
+
+/// A symlink target is only allowed when it is relative and stays inside
+/// `dest` after resolving `.`/`..` lexically. Together with
+/// [`safe_entry_path`] (nothing is ever written through a link) that makes
+/// every link we create resolve inside `dest` at run time too, including
+/// link-to-link chains: each link's lexical target stays inside, so a chain
+/// can never leave.
+fn symlink_target_stays_inside(dest: &Path, link_dir: &Path, target: &str) -> bool {
+    let target = target.trim_end_matches('\0');
+    let relative = Path::new(target);
+    if relative.is_absolute() {
+        return false;
+    }
+    let mut resolved = link_dir.to_path_buf();
+    for component in relative.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::Normal(part) => resolved.push(part),
+            // `..` is allowed while it stays at or inside `dest` (e.g.
+            // `bin/tool -> ../lib/tool`); anything that would climb above
+            // `dest` is rejected.
+            std::path::Component::ParentDir => {
+                resolved.pop();
+                if !resolved.starts_with(dest) {
+                    return false;
+                }
+            }
+            // Absolute targets (and Windows prefixes) resolve outside by
+            // definition.
+            _ => return false,
+        }
+    }
+    resolved.starts_with(dest)
+}
+
 fn unpack_zip(bytes: &[u8], dest: &Path, cap: u64) -> Result<(), InstallError> {
     use std::io::Write;
 
@@ -594,12 +680,7 @@ fn unpack_zip(bytes: &[u8], dest: &Path, cap: u64) -> Result<(), InstallError> {
                 path: entry.name().to_string(),
             });
         };
-        let out = dest.join(relative);
-
-        written += entry.size();
-        if written > cap {
-            return Err(InstallError::UnpackTooLarge);
-        }
+        let out = safe_entry_path(dest, &relative)?;
 
         if entry.is_dir() {
             std::fs::create_dir_all(&out)?;
@@ -611,12 +692,25 @@ fn unpack_zip(bytes: &[u8], dest: &Path, cap: u64) -> Result<(), InstallError> {
         // explicitly; the macOS `.app` zips (junie) need both, so restore them
         // instead of leaving everything 0o644 regular files.
         if entry.is_symlink() {
+            // `take` bounds the read: declared sizes in the central directory
+            // cannot be trusted to feed the cap accounting.
+            let budget = cap - written + 1;
+            let mut limited = (&mut entry).take(budget);
             let mut link_target = String::new();
-            entry
+            limited
                 .read_to_string(&mut link_target)
                 .map_err(|e| InstallError::Unpack(e.to_string()))?;
+            written += budget - limited.limit();
+            if written > cap {
+                return Err(InstallError::UnpackTooLarge);
+            }
             #[cfg(unix)]
             {
+                if !symlink_target_stays_inside(dest, out.parent().unwrap_or(dest), &link_target) {
+                    return Err(InstallError::UnsafeEntry {
+                        path: relative.display().to_string(),
+                    });
+                }
                 if let Some(parent) = out.parent() {
                     std::fs::create_dir_all(parent)?;
                 }
@@ -633,7 +727,14 @@ fn unpack_zip(bytes: &[u8], dest: &Path, cap: u64) -> Result<(), InstallError> {
             std::fs::create_dir_all(parent)?;
         }
         let mut file = std::fs::File::create(&out)?;
-        std::io::copy(&mut entry, &mut file)?;
+        // Bound the actual copy, not the declared size: a crafted archive can
+        // understate it.
+        let mut limited = (&mut entry).take(cap - written + 1);
+        let copied = std::io::copy(&mut limited, &mut file)?;
+        written += copied;
+        if written > cap {
+            return Err(InstallError::UnpackTooLarge);
+        }
         file.flush()?;
         apply_unix_mode(&out, entry.unix_mode())?;
     }
@@ -646,7 +747,8 @@ fn apply_unix_mode(path: &Path, mode: Option<u32>) -> Result<(), InstallError> {
     use std::os::unix::fs::PermissionsExt;
 
     if let Some(mode) = mode {
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode & 0o7777))?;
+        // 0o777, not 0o7777: no setuid/setgid/sticky from an archive.
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode & 0o777))?;
     }
     Ok(())
 }
@@ -1023,5 +1125,120 @@ mod tests {
             unpack_capped(&bytes, &target("https://x/a.zip"), dest.path(), 4),
             Err(InstallError::UnpackTooLarge)
         ));
+    }
+
+    /// Rewrites the fixed header of the first central-directory entry, so a
+    /// test can craft archives the writer API refuses to produce (lying
+    /// sizes, setuid modes).
+    fn patch_first_cd_entry(bytes: &mut Vec<u8>, write: impl FnOnce(&mut [u8])) {
+        let eocd = bytes
+            .windows(4)
+            .rposition(|window| window == b"PK\x05\x06")
+            .expect("end of central directory");
+        let cd_offset =
+            u32::from_le_bytes(bytes[eocd + 16..eocd + 20].try_into().unwrap()) as usize;
+        assert_eq!(&bytes[cd_offset..cd_offset + 4], b"PK\x01\x02");
+        write(&mut bytes[cd_offset..cd_offset + 46]);
+    }
+
+    #[test]
+    fn zip_understated_sizes_are_caught_by_the_copy_limit() {
+        // 5 actual bytes, declared as 1: the declared-size accounting would
+        // pass a 4-byte cap, the bounded copy must not.
+        let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        writer
+            .start_file(
+                "big",
+                zip::write::SimpleFileOptions::default()
+                    .compression_method(zip::CompressionMethod::Deflated),
+            )
+            .unwrap();
+        writer.write_all(b"xxxxx").unwrap();
+        let mut bytes = writer.finish().unwrap().into_inner();
+        patch_first_cd_entry(&mut bytes, |entry| {
+            // compressed size (offset 20) stays true so the reader streams
+            // everything; only the uncompressed size (offset 24) lies.
+            entry[24..28].copy_from_slice(&1u32.to_le_bytes());
+        });
+
+        let dest = tempfile::tempdir().unwrap();
+        assert!(matches!(
+            unpack_capped(&bytes, &target("https://x/a.zip"), dest.path(), 4),
+            Err(InstallError::UnpackTooLarge)
+        ));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn zip_setuid_bits_are_dropped() {
+        let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        writer
+            .start_file("bin/agent", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        writer.write_all(b"agent").unwrap();
+        let mut bytes = writer.finish().unwrap().into_inner();
+        patch_first_cd_entry(&mut bytes, |entry| {
+            // external attributes = S_IFREG | setuid | rwxr-xr-x in the high word
+            let mode: u32 = 0o104_755;
+            entry[38..42].copy_from_slice(&(mode << 16).to_le_bytes());
+        });
+
+        let dest = tempfile::tempdir().unwrap();
+        unpack(&bytes, &target("https://x/a.zip"), dest.path()).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(dest.path().join("bin/agent"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o7000, 0, "setuid/setgid/sticky must not survive");
+        assert_eq!(mode & 0o777, 0o755);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn zip_symlinks_cannot_escape_or_be_written_through() {
+        let options = zip::write::SimpleFileOptions::default();
+
+        // A target that climbs out of the install dir is refused.
+        let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        writer.add_symlink("up", "..", options).unwrap();
+        let bytes = writer.finish().unwrap().into_inner();
+        let dest = tempfile::tempdir().unwrap();
+        assert!(matches!(
+            unpack(&bytes, &target("https://x/a.zip"), dest.path()),
+            Err(InstallError::UnsafeEntry { .. })
+        ));
+
+        // So is an absolute target.
+        let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        writer.add_symlink("abs", "/etc/passwd", options).unwrap();
+        let bytes = writer.finish().unwrap().into_inner();
+        let dest = tempfile::tempdir().unwrap();
+        assert!(matches!(
+            unpack(&bytes, &target("https://x/a.zip"), dest.path()),
+            Err(InstallError::UnsafeEntry { .. })
+        ));
+
+        // A legitimate in-tree link is created, but a later entry writing
+        // *through* it is refused: without that check, `lib -> ~/.ssh` plus
+        // `lib/authorized_keys` writes outside the install dir at install
+        // time.
+        let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        writer.add_symlink("lib", "inner", options).unwrap();
+        writer.start_file("lib/authorized_keys", options).unwrap();
+        writer.write_all(b"evil").unwrap();
+        let bytes = writer.finish().unwrap().into_inner();
+        let dest = tempfile::tempdir().unwrap();
+        assert!(matches!(
+            unpack(&bytes, &target("https://x/a.zip"), dest.path()),
+            Err(InstallError::UnsafeEntry { .. })
+        ));
+        assert!(
+            std::fs::symlink_metadata(dest.path().join("lib"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert!(!dest.path().join("inner").exists());
     }
 }

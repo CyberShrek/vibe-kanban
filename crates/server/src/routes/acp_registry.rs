@@ -93,9 +93,11 @@ async fn install_agent(
         .find(|agent| agent.id == id)
         .ok_or_else(|| ApiError::BadRequest(format!("Unknown ACP registry agent '{id}'")))?;
 
-    // Refuse built-ins, already installed agents and key collisions alike
+    // Refuse built-ins and key collisions, but treat the same registry agent
+    // as an update: Settings offers no other update path, and a registry bump
+    // must not leave the installed version undownloadable.
     let key = registry_key(&agent.id);
-    if ExecutorConfigs::get_cached().executors.contains_key(&key) {
+    if profile_conflicts(&ExecutorConfigs::get_cached(), &agent.id, &key) {
         return Err(ApiError::Conflict(format!(
             "An executor named '{key}' already exists"
         )));
@@ -121,20 +123,24 @@ async fn install_agent(
 
     // Re-check under the lock: a concurrent install may have won the race.
     let mut profiles = ExecutorConfigs::get_cached();
-    if profiles.executors.contains_key(&key) {
+    if profile_conflicts(&profiles, &agent.id, &key) {
         return Err(ApiError::Conflict(format!(
             "An executor named '{key}' already exists"
         )));
     }
 
-    let mut profile = ExecutorProfile {
-        recently_used_models: None,
-        configurations: HashMap::new(),
-    };
-    profile.set_default(CodingAgent::AcpServer(AcpServer::new(agent.id.clone())));
-    profiles.executors.insert(key, profile);
-    profiles.save_overrides()?;
-    ExecutorConfigs::reload();
+    // Update path: the profile already points at this agent, only the archive
+    // was refreshed above.
+    if let std::collections::hash_map::Entry::Vacant(slot) = profiles.executors.entry(key) {
+        let mut profile = ExecutorProfile {
+            recently_used_models: None,
+            configurations: HashMap::new(),
+        };
+        profile.set_default(CodingAgent::AcpServer(AcpServer::new(agent.id.clone())));
+        slot.insert(profile);
+        profiles.save_overrides()?;
+        ExecutorConfigs::reload();
+    }
 
     Ok(ResponseJson(ApiResponse::success(AcpRegistryAgent::new(
         agent,
@@ -205,6 +211,12 @@ fn registry_install_key(profiles: &ExecutorConfigs, id: &str) -> Option<BaseCodi
         .then_some(key)
 }
 
+/// The executor key is taken, and not by this very registry agent (whose
+/// existing profile makes an install an update instead of a conflict).
+fn profile_conflicts(profiles: &ExecutorConfigs, id: &str, key: &BaseCodingAgent) -> bool {
+    profiles.executors.contains_key(key) && registry_install_key(profiles, id).is_none()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -246,5 +258,21 @@ mod tests {
         // "some.agent" and "some-agent" both map to SOME_AGENT
         let profiles = with_registry_agent("SOME_AGENT", "some-agent");
         assert_eq!(registry_install_key(&profiles, "some.agent"), None);
+    }
+
+    #[test]
+    fn reinstalling_the_same_registry_agent_is_an_update_not_a_conflict() {
+        let profiles = with_registry_agent("KILO", "kilo");
+        let key = BaseCodingAgent::from("KILO".to_string());
+        assert!(!profile_conflicts(&profiles, "kilo", &key));
+        // A different agent squatting on the same key still conflicts
+        assert!(profile_conflicts(&profiles, "kilo2", &key));
+        // Built-in keys (no AcpServer profile) conflict
+        let defaults = ExecutorConfigs::from_defaults();
+        assert!(profile_conflicts(
+            &defaults,
+            "claude-code",
+            &registry_key("claude-code")
+        ));
     }
 }

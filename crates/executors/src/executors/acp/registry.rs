@@ -226,7 +226,9 @@ pub async fn command_for(
         }
     })?;
 
-    let installed = install::installed(&agent.id, &agent.version, host, target)?;
+    // `install::installed` never downloads and serves the version on disk, so
+    // a registry bump does not break a running install (Settings updates it).
+    let installed = install::installed(&agent.id, host, target)?;
     let command = CommandBuilder::new(install::command_line(&installed.command))
         .extend_params(installed.args.clone());
 

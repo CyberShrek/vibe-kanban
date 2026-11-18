@@ -64,7 +64,9 @@ async fn registry_installed() -> Option<OpencodeVersion> {
     let agent = agents.iter().find(|agent| agent.id == V2_REGISTRY_ID)?;
     let platform = install::platform_key()?;
     let target = agent.distribution.binary.get(platform)?;
-    let installed = install::installed(V2_REGISTRY_ID, &agent.version, platform, target).ok()?;
+    // Serves whatever version is on disk, so a registry bump does not hide V2
+    // again before the user updates.
+    let installed = install::installed(V2_REGISTRY_ID, platform, target).ok()?;
 
     let output = tokio::time::timeout(
         VERSION_TIMEOUT,
